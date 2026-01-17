@@ -5,17 +5,19 @@ from .config import ModelConfig
 from .factors import FeatureEngineer
 
 class CryptoDataLoader:
-    def __init__(self):
+    def __init__(self, train_ratio=0.8):
         self.engine = sqlalchemy.create_engine(ModelConfig.DB_URL)
         self.feat_tensor = None
         self.raw_data_cache = None
         self.target_ret = None
-        
+        self.train_ratio = train_ratio
+        self.split_idx = None
+
     def load_data(self, limit_tokens=500):
         print("Loading data from SQL...")
         top_query = f"""
-        SELECT address FROM tokens 
-        LIMIT {limit_tokens} 
+        SELECT address FROM tokens
+        LIMIT {limit_tokens}
         """
         addrs = pd.read_sql(top_query, self.engine)['address'].tolist()
         if not addrs: raise ValueError("No tokens found.")
@@ -46,4 +48,30 @@ class CryptoDataLoader:
         t2 = torch.roll(op, -2, dims=1)
         self.target_ret = torch.log(t2 / (t1 + 1e-9))
         self.target_ret[:, -2:] = 0.0
+
+        # Calculate train/val split
+        T = self.feat_tensor.shape[2]  # Time dimension
+        self.split_idx = int(T * self.train_ratio)
+
         print(f"Data Ready. Shape: {self.feat_tensor.shape}")
+        print(f"Train/Val Split: {self.split_idx}/{T - self.split_idx}")
+
+    def get_train_data(self):
+        """Get training data"""
+        if self.split_idx is None:
+            raise ValueError("Data not loaded yet")
+        return {
+            'features': self.feat_tensor[:, :, :self.split_idx],
+            'raw_data': {k: v[:, :self.split_idx] for k, v in self.raw_data_cache.items()},
+            'target_ret': self.target_ret[:, :self.split_idx]
+        }
+
+    def get_val_data(self):
+        """Get validation data"""
+        if self.split_idx is None:
+            raise ValueError("Data not loaded yet")
+        return {
+            'features': self.feat_tensor[:, :, self.split_idx:],
+            'raw_data': {k: v[:, self.split_idx:] for k, v in self.raw_data_cache.items()},
+            'target_ret': self.target_ret[:, self.split_idx:]
+        }
