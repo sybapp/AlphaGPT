@@ -6,6 +6,7 @@ from loguru import logger
 import pandas as pd
 
 from data_pipeline.data_manager import DataManager
+from model_core.config import ModelConfig
 from model_core.vm import StackVM
 from model_core.data_loader import CryptoDataLoader
 from execution.trader import SolanaTrader
@@ -21,8 +22,9 @@ class StrategyRunner:
         self.risk = RiskEngine()
         self.trader = SolanaTrader()
         self.vm = StackVM()
-        
-        self.loader = CryptoDataLoader()
+
+        self.factor_mode = ModelConfig.FACTOR_MODE
+        self.loader = CryptoDataLoader(factor_mode=self.factor_mode)
         self.token_map = {} # {address: tensor_index} 用于快速查找特征
         self.last_scan_time = 0
         

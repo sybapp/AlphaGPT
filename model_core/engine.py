@@ -10,7 +10,7 @@ from .vm import StackVM
 from .backtest import MemeBacktest
 
 class AlphaEngine:
-    def __init__(self, use_lord_regularization=True, lord_decay_rate=1e-3, lord_num_iterations=5):
+    def __init__(self, use_lord_regularization=True, lord_decay_rate=1e-3, lord_num_iterations=5, factor_mode=None):
         """
         Initialize AlphaGPT training engine.
         
@@ -19,7 +19,8 @@ class AlphaEngine:
             lord_decay_rate: Strength of LoRD regularization
             lord_num_iterations: Number of Newton-Schulz iterations per step
         """
-        self.loader = CryptoDataLoader()
+        self.factor_mode = (factor_mode or ModelConfig.FACTOR_MODE)
+        self.loader = CryptoDataLoader(factor_mode=self.factor_mode)
         self.loader.load_data()
         
         self.model = AlphaGPT().to(ModelConfig.DEVICE)
