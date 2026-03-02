@@ -3,7 +3,7 @@ import torch
 import sqlalchemy
 
 from .config import ModelConfig
-from .factors import FeatureEngineer, AdvancedFactorEngineer, AlBrooksFactorEngineer
+from .factors import FeatureEngineer, AdvancedFactorEngineer, AlBrooksFactorEngineer, ICTSMCFactorEngineer
 
 
 class CryptoDataLoader:
@@ -21,6 +21,8 @@ class CryptoDataLoader:
             return self._advanced_engineer.compute_advanced_features(raw_data_cache)
         if self.factor_mode == "albrooks":
             return AlBrooksFactorEngineer.compute_features(raw_data_cache)
+        if self.factor_mode == "ictsmc":
+            return ICTSMCFactorEngineer.compute_features(raw_data_cache)
         return FeatureEngineer.compute_features(raw_data_cache)
 
     def load_data(self, limit_tokens=500):

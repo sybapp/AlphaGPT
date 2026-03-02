@@ -17,5 +17,6 @@ class ModelConfig:
         "basic": 6,
         "advanced": 12,
         "albrooks": 10,
+        "ictsmc": 12,
     }
     INPUT_DIM = FACTOR_DIMS.get(FACTOR_MODE, FACTOR_DIMS["basic"])
