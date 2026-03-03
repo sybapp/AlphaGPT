@@ -1,10 +1,13 @@
 import torch
 
+from .config import ModelConfig
+
+
 class MemeBacktest:
     def __init__(self):
-        self.trade_size = 1000.0
-        self.min_liq = 500000.0
-        self.base_fee = 0.0060
+        self.trade_size = ModelConfig.TRADE_SIZE_USD
+        self.min_liq = ModelConfig.MIN_LIQUIDITY
+        self.base_fee = ModelConfig.BASE_FEE
 
     def evaluate(self, factors, raw_data, target_ret):
         liquidity = raw_data['liquidity']

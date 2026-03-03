@@ -13,6 +13,13 @@ class CryptoDataLoader:
         self.raw_data_cache = None
         self.target_ret = None
 
+        self.feat_tensor_train = None
+        self.feat_tensor_test = None
+        self.target_ret_train = None
+        self.target_ret_test = None
+        self.raw_data_train = None
+        self.raw_data_test = None
+
         self.factor_mode = (factor_mode or ModelConfig.FACTOR_MODE).strip().lower()
         self._advanced_engineer = AdvancedFactorEngineer()
 
@@ -68,4 +75,19 @@ class CryptoDataLoader:
         if torch.isnan(self.feat_tensor).any() or torch.isinf(self.feat_tensor).any():
             self.feat_tensor = torch.nan_to_num(self.feat_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
 
-        print(f"Data Ready. Mode: {self.factor_mode} | Shape: {self.feat_tensor.shape}")
+        time_len = self.feat_tensor.shape[-1]
+        split_idx = int(time_len * ModelConfig.TRAIN_SPLIT_RATIO)
+        split_idx = max(2, min(split_idx, time_len - 2))
+
+        self.feat_tensor_train = self.feat_tensor[:, :, :split_idx]
+        self.feat_tensor_test = self.feat_tensor[:, :, split_idx:]
+        self.target_ret_train = self.target_ret[:, :split_idx]
+        self.target_ret_test = self.target_ret[:, split_idx:]
+
+        self.raw_data_train = {k: v[:, :split_idx] for k, v in self.raw_data_cache.items()}
+        self.raw_data_test = {k: v[:, split_idx:] for k, v in self.raw_data_cache.items()}
+
+        print(
+            f"Data Ready. Mode: {self.factor_mode} | Full: {self.feat_tensor.shape} | "
+            f"Train: {self.feat_tensor_train.shape} | Test: {self.feat_tensor_test.shape}"
+        )

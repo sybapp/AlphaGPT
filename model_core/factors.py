@@ -2,6 +2,24 @@ import torch
 import torch.nn as nn
 
 
+def _causal_robust_norm(t, window=64, clip=5.0, eps=1e-6):
+    """Causal robust normalization: each step uses current + historical window only."""
+    if t.shape[1] <= 1:
+        return torch.zeros_like(t)
+
+    window = max(2, min(window, t.shape[1]))
+    pad = t[:, :1].repeat(1, window - 1)
+    t_pad = torch.cat([pad, t], dim=1)
+    t_win = t_pad.unfold(1, window, 1)
+
+    median = torch.nanmedian(t_win, dim=-1).values
+    mad = torch.nanmedian(torch.abs(t_win - median.unsqueeze(-1)), dim=-1).values
+    mad = mad + eps
+
+    norm = (t - median) / mad
+    return torch.clamp(norm, -clip, clip)
+
+
 class RMSNormFactor(nn.Module):
     """RMSNorm for factor normalization"""
     def __init__(self, d_model, eps=1e-6):
@@ -96,11 +114,8 @@ class AdvancedFactorEngineer:
         self.rms_norm = RMSNormFactor(1)
     
     def robust_norm(self, t):
-        """Robust normalization using median absolute deviation"""
-        median = torch.nanmedian(t, dim=1, keepdim=True)[0]
-        mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
-        norm = (t - median) / mad
-        return torch.clamp(norm, -5.0, 5.0)
+        """Causal robust normalization using median absolute deviation"""
+        return _causal_robust_norm(t)
     
     def compute_advanced_features(self, raw_dict):
         """Compute 12-dimensional feature space with advanced factors"""
@@ -159,10 +174,7 @@ class AlBrooksFactorEngineer:
 
     @staticmethod
     def robust_norm(t):
-        median = torch.nanmedian(t, dim=1, keepdim=True)[0]
-        mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
-        norm = (t - median) / mad
-        return torch.clamp(norm, -5.0, 5.0)
+        return _causal_robust_norm(t)
 
     @staticmethod
     def _rolling_prev_window(x, window):
@@ -203,7 +215,15 @@ class AlBrooksFactorEngineer:
         prev_close[:, 0] = c[:, 0]
         ret = torch.log(c / (prev_close + eps))
 
-        tc = torch.sign(cls._ema(ret, 3) * cls._ema(ret, 8))
+        ret_window10 = cls._rolling_window(ret, 10)
+        ret_std10 = ret_window10.std(dim=-1)
+        ret_median10 = ret_window10.median(dim=-1).values
+        ret_mad10 = (ret_window10 - ret_median10.unsqueeze(-1)).abs().median(dim=-1).values
+
+        ema_ret3 = cls._ema(ret, 3)
+        ema_ret8 = cls._ema(ret, 8)
+        trend_scale = ret_std10 + 0.5 * ret_mad10 + 1e-6
+        tc = torch.tanh((ema_ret3 - ema_ret8) / trend_scale)
 
         max_high_prev20 = cls._rolling_prev_window(h, 20).max(dim=-1).values
         bo = (c - max_high_prev20) / (max_high_prev20 + eps)
@@ -220,12 +240,13 @@ class AlBrooksFactorEngineer:
         prev_low = torch.roll(l, 1, dims=1)
         prev_high[:, 0] = h[:, 0]
         prev_low[:, 0] = l[:, 0]
-        ib = ((h <= prev_high) & (l >= prev_low)).float()
+        prev_bar_range = torch.clamp(prev_high - prev_low, min=eps)
+        compression = torch.clamp(1.0 - (bar_range / prev_bar_range), 0.0, 1.0)
+        ib = ((h <= prev_high) & (l >= prev_low)).float() * compression
 
-        ret_window10 = cls._rolling_window(ret, 10)
-        ret_std10 = ret_window10.std(dim=-1)
         ema_ret10 = cls._ema(ret, 10)
-        rv = ret_std10 / (torch.abs(ema_ret10) + 1e-4)
+        rv_floor = 0.5 * ret_mad10 + 1e-6
+        rv = torch.tanh(ema_ret10 / (ret_std10 + rv_floor))
 
         vol_prev10 = cls._rolling_prev_window(v, 10)
         vol_median10 = torch.median(vol_prev10, dim=-1).values
@@ -233,10 +254,12 @@ class AlBrooksFactorEngineer:
         vo = (v - vol_median10) / (vol_mad10 + 1e-6)
         vo = torch.clamp(vo, -5.0, 5.0)
 
-        fd = ((bo > 0) & (c < o) & (c < max_high_prev20 * 0.995)).float()
-
         tr = torch.maximum(h - l, torch.maximum(torch.abs(h - prev_close), torch.abs(l - prev_close)))
         atr20 = cls._rolling_window(tr, 20).mean(dim=-1)
+        breakout_excess = torch.relu(c - max_high_prev20) / (atr20 + 1e-6)
+        rejection = torch.relu(o - c) / (atr20 + 1e-6)
+        fd = torch.clamp(breakout_excess * rejection, 0.0, 5.0)
+
         ema20 = cls._ema(c, 20)
         cb = (c - ema20) / (atr20 + 1e-6)
 
@@ -262,10 +285,7 @@ class ICTSMCFactorEngineer:
 
     @staticmethod
     def robust_norm(t):
-        median = torch.nanmedian(t, dim=1, keepdim=True)[0]
-        mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
-        norm = (t - median) / mad
-        return torch.clamp(norm, -5.0, 5.0)
+        return _causal_robust_norm(t)
 
     @staticmethod
     def _rolling_prev_window(x, window):
@@ -278,6 +298,15 @@ class ICTSMCFactorEngineer:
         pad = x[:, :1].repeat(1, window - 1)
         x_pad = torch.cat([pad, x], dim=1)
         return x_pad.unfold(1, window, 1)
+
+    @staticmethod
+    def _ema(x, span):
+        alpha = 2.0 / (span + 1.0)
+        ema = torch.zeros_like(x)
+        ema[:, 0] = x[:, 0]
+        for t in range(1, x.shape[1]):
+            ema[:, t] = alpha * x[:, t] + (1.0 - alpha) * ema[:, t - 1]
+        return ema
 
     @classmethod
     def compute_features(cls, raw_dict):
@@ -308,12 +337,15 @@ class ICTSMCFactorEngineer:
         swing_low_prev = cls._rolling_prev_window(l, swing_k).min(dim=-1).values
         bos_up = (c > swing_high_prev).float()
         bos_dn = (c < swing_low_prev).float()
-        bos = bos_up - bos_dn
+        bos_raw = bos_up - bos_dn
+        bos_smooth = cls._ema(bos_raw, 3)
+        bos = torch.clamp(bos_smooth, -1.0, 1.0)
 
-        # 3) CHOCH: signed change-of-character proxy
-        prev_bos = torch.roll(bos, 1, dims=1)
-        prev_bos[:, 0] = 0.0
-        choch = torch.where((prev_bos * bos) < 0.0, bos, torch.zeros_like(bos))
+        # 3) CHOCH: continuous change-of-character intensity
+        bos_diff = bos - torch.roll(bos, 1, dims=1)
+        bos_diff[:, 0] = 0.0
+        choch = torch.tanh(bos_diff * 2.0)
+
 
         # 4) FVG_GAP: signed fair-value-gap amplitude
         high_t2 = torch.roll(h, 2, dims=1)
@@ -371,38 +403,51 @@ class ICTSMCFactorEngineer:
         ob_prox = torch.zeros_like(c)
         brk_ob = torch.zeros_like(c)
 
-        last_ob_low = torch.zeros(n_tokens, device=c.device)
-        last_ob_high = torch.zeros(n_tokens, device=c.device)
-        last_ob_dir = torch.zeros(n_tokens, device=c.device)
+        ob_layers = 3
+        layer_idx = torch.zeros(n_tokens, dtype=torch.long, device=c.device)
+        ob_low_layers = torch.zeros((n_tokens, ob_layers), device=c.device)
+        ob_high_layers = torch.zeros((n_tokens, ob_layers), device=c.device)
+        ob_dir_layers = torch.zeros((n_tokens, ob_layers), device=c.device)
 
         for t in range(n_time):
             bull_disp = disp_event[:, t] & (body[:, t] > 0)
             bear_disp = disp_event[:, t] & (body[:, t] < 0)
 
             if bull_disp.any():
-                last_ob_low[bull_disp] = prev_body_low[bull_disp, t]
-                last_ob_high[bull_disp] = prev_body_high[bull_disp, t]
-                last_ob_dir[bull_disp] = 1.0
+                idx = layer_idx[bull_disp]
+                ob_low_layers[bull_disp, idx] = prev_body_low[bull_disp, t]
+                ob_high_layers[bull_disp, idx] = prev_body_high[bull_disp, t]
+                ob_dir_layers[bull_disp, idx] = 1.0
+                layer_idx[bull_disp] = (idx + 1) % ob_layers
+
             if bear_disp.any():
-                last_ob_low[bear_disp] = prev_body_low[bear_disp, t]
-                last_ob_high[bear_disp] = prev_body_high[bear_disp, t]
-                last_ob_dir[bear_disp] = -1.0
+                idx = layer_idx[bear_disp]
+                ob_low_layers[bear_disp, idx] = prev_body_low[bear_disp, t]
+                ob_high_layers[bear_disp, idx] = prev_body_high[bear_disp, t]
+                ob_dir_layers[bear_disp, idx] = -1.0
+                layer_idx[bear_disp] = (idx + 1) % ob_layers
 
-            ob_mid = (last_ob_low + last_ob_high) / 2.0
-            ob_half = torch.clamp((last_ob_high - last_ob_low) / 2.0, min=eps)
-            ob_dist = torch.abs(c[:, t] - ob_mid) / (ob_half + atr14[:, t] + eps)
-            ob_prox[:, t] = torch.clamp(1.0 - ob_dist, 0.0, 1.0)
+            layer_width = torch.clamp(ob_high_layers - ob_low_layers, min=eps)
+            valid = ob_dir_layers != 0.0
 
-            in_zone = (c[:, t] >= last_ob_low) & (c[:, t] <= last_ob_high)
-            invalid_bull = (last_ob_dir > 0) & (c[:, t] < last_ob_low)
-            invalid_bear = (last_ob_dir < 0) & (c[:, t] > last_ob_high)
-            retest_bull = (last_ob_dir > 0) & in_zone & (c[:, t] < ob_mid)
-            retest_bear = (last_ob_dir < 0) & in_zone & (c[:, t] > ob_mid)
-            brk_ob[:, t] = torch.where(
+            layer_mid = (ob_low_layers + ob_high_layers) / 2.0
+            layer_half = layer_width / 2.0
+            layer_dist = torch.abs(c[:, t].unsqueeze(-1) - layer_mid) / (layer_half + atr14[:, t].unsqueeze(-1) + eps)
+            layer_prox = torch.clamp(1.0 - layer_dist, 0.0, 1.0) * valid.float()
+            ob_prox[:, t] = layer_prox.max(dim=-1).values
+
+            in_zone = (c[:, t].unsqueeze(-1) >= ob_low_layers) & (c[:, t].unsqueeze(-1) <= ob_high_layers) & valid
+            invalid_bull = (ob_dir_layers > 0) & (c[:, t].unsqueeze(-1) < ob_low_layers)
+            invalid_bear = (ob_dir_layers < 0) & (c[:, t].unsqueeze(-1) > ob_high_layers)
+            retest_bull = (ob_dir_layers > 0) & in_zone & (c[:, t].unsqueeze(-1) < layer_mid)
+            retest_bear = (ob_dir_layers < 0) & in_zone & (c[:, t].unsqueeze(-1) > layer_mid)
+
+            layer_break = torch.where(
                 invalid_bull | retest_bull,
-                -torch.ones_like(c[:, t]),
-                torch.where(invalid_bear | retest_bear, torch.ones_like(c[:, t]), torch.zeros_like(c[:, t]))
+                -layer_prox,
+                torch.where(invalid_bear | retest_bear, layer_prox, torch.zeros_like(layer_prox))
             )
+            brk_ob[:, t] = layer_break.sum(dim=-1) / valid.float().sum(dim=-1).clamp_min(1.0)
 
         # 8) DISP: displacement strength (bounded)
         disp = torch.clamp(disp_raw * (1.0 + torch.relu(vol_z)), 0.0, 5.0)
@@ -416,8 +461,8 @@ class ICTSMCFactorEngineer:
         eq_high = (high_spread / (atr14 + eps) < 0.4).float()
         eq_low = (low_spread / (atr14 + eps) < 0.4).float()
 
-        high_pool = prev_high_m.mean(dim=-1)
-        low_pool = prev_low_m.mean(dim=-1)
+        high_pool = prev_high_m.median(dim=-1).values
+        low_pool = prev_low_m.median(dim=-1).values
         prox_high = torch.exp(-torch.abs(c - high_pool) / (atr14 + eps)) * eq_high
         prox_low = torch.exp(-torch.abs(c - low_pool) / (atr14 + eps)) * eq_low
         eqhl = torch.clamp(prox_low - prox_high, -1.0, 1.0)
@@ -427,7 +472,8 @@ class ICTSMCFactorEngineer:
         dr_low = cls._rolling_prev_window(l, 20).min(dim=-1).values
         dr_mid = (dr_high + dr_low) / 2.0
         dr_half = torch.clamp((dr_high - dr_low) / 2.0, min=eps)
-        pd_loc = torch.clamp((c - dr_mid) / dr_half, -3.0, 3.0)
+        pd_loc_raw = torch.clamp((c - dr_mid) / dr_half, -3.0, 3.0)
+        pd_loc = torch.tanh(pd_loc_raw - cls._ema(pd_loc_raw, 5))
 
         # 11) MIT: post-BOS mitigation/retest confirmation (signed)
         mit = torch.zeros_like(c)
@@ -492,10 +538,7 @@ class FeatureEngineer:
         log_vol = torch.log1p(v)
 
         def robust_norm(t):
-            median = torch.nanmedian(t, dim=1, keepdim=True)[0]
-            mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
-            norm = (t - median) / mad
-            return torch.clamp(norm, -5.0, 5.0)
+            return _causal_robust_norm(t)
 
         features = torch.stack([
             robust_norm(ret),

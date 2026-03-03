@@ -49,11 +49,15 @@ class AlphaEngine:
         self.bt = MemeBacktest()
         
         self.best_score = -float('inf')
+        self.best_train_score = -float('inf')
         self.best_formula = None
         self.training_history = {
             'step': [],
             'avg_reward': [],
+            'avg_test_score': [],
+            'avg_generalization_gap': [],
             'best_score': [],
+            'best_train_score': [],
             'stable_rank': []
         }
 
@@ -84,27 +88,52 @@ class AlphaEngine:
             seqs = torch.stack(tokens_list, dim=1)
             
             rewards = torch.zeros(bs, device=ModelConfig.DEVICE)
-            
+            test_scores = torch.zeros(bs, device=ModelConfig.DEVICE)
+            generalization_gaps = torch.zeros(bs, device=ModelConfig.DEVICE)
+
             for i in range(bs):
                 formula = seqs[i].tolist()
-                
-                res = self.vm.execute(formula, self.loader.feat_tensor)
-                
-                if res is None:
+
+                res_train = self.vm.execute(formula, self.loader.feat_tensor_train)
+
+                if res_train is None:
                     rewards[i] = -5.0
+                    test_scores[i] = -5.0
+                    generalization_gaps[i] = 0.0
                     continue
-                
-                if res.std() < 1e-4:
+
+                if res_train.std() < 1e-4:
                     rewards[i] = -2.0
+                    test_scores[i] = -2.0
+                    generalization_gaps[i] = 0.0
                     continue
-                
-                score, ret_val = self.bt.evaluate(res, self.loader.raw_data_cache, self.loader.target_ret)
-                rewards[i] = score
-                
-                if score.item() > self.best_score:
-                    self.best_score = score.item()
+
+                res_test = self.vm.execute(formula, self.loader.feat_tensor_test)
+                if res_test is None or res_test.std() < 1e-4:
+                    rewards[i] = -2.0
+                    test_scores[i] = -2.0
+                    generalization_gaps[i] = 0.0
+                    continue
+
+                train_score, train_ret = self.bt.evaluate(res_train, self.loader.raw_data_train, self.loader.target_ret_train)
+                test_score, test_ret = self.bt.evaluate(res_test, self.loader.raw_data_test, self.loader.target_ret_test)
+
+                rewards[i] = train_score
+                test_scores[i] = test_score
+                gap = train_score - test_score
+                generalization_gaps[i] = gap
+
+                combined_score = test_score - 0.1 * torch.abs(gap)
+                if combined_score.item() > self.best_score:
+                    self.best_score = combined_score.item()
+                    self.best_train_score = train_score.item()
                     self.best_formula = formula
-                    tqdm.write(f"[!] New King: Score {score:.2f} | Ret {ret_val:.2%} | Formula {formula}")
+                    tqdm.write(
+                        f"[!] New King: Combined {combined_score:.2f} | "
+                        f"Train {train_score:.2f} ({train_ret:.2%}) | "
+                        f"Test {test_score:.2f} ({test_ret:.2%}) | Gap {gap:.2f} | "
+                        f"Formula {formula}"
+                    )
             
             # Normalize rewards
             adv = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
@@ -126,7 +155,13 @@ class AlphaEngine:
             
             # Logging
             avg_reward = rewards.mean().item()
-            postfix_dict = {'AvgRew': f"{avg_reward:.3f}", 'BestScore': f"{self.best_score:.3f}"}
+            avg_test_score = test_scores.mean().item()
+            avg_gap = generalization_gaps.mean().item()
+            postfix_dict = {
+                'TrainAvg': f"{avg_reward:.3f}",
+                'TestAvg': f"{avg_test_score:.3f}",
+                'BestCombo': f"{self.best_score:.3f}"
+            }
             
             if self.use_lord and step % 100 == 0:
                 stable_rank = self.rank_monitor.compute()
@@ -135,7 +170,10 @@ class AlphaEngine:
             
             self.training_history['step'].append(step)
             self.training_history['avg_reward'].append(avg_reward)
+            self.training_history['avg_test_score'].append(avg_test_score)
+            self.training_history['avg_generalization_gap'].append(avg_gap)
             self.training_history['best_score'].append(self.best_score)
+            self.training_history['best_train_score'].append(self.best_train_score)
             
             pbar.set_postfix(postfix_dict)
 
@@ -149,7 +187,8 @@ class AlphaEngine:
             js.dump(self.training_history, f)
         
         print(f"\n✓ Training completed!")
-        print(f"  Best score: {self.best_score:.4f}")
+        print(f"  Best combined score: {self.best_score:.4f}")
+        print(f"  Best train score: {self.best_train_score:.4f}")
         print(f"  Best formula: {self.best_formula}")
 
 
